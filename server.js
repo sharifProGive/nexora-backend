@@ -1,296 +1,233 @@
+'use strict';
 /* © 2026 Zentora CLC. All rights reserved. Platform Core engineered by Zentora. */
+/**
+ * Nexora backend (self-hosted): Express + SQLite (node:sqlite) + local media storage.
+ * No Firebase, no third-party database, no third-party storage. The only external call is the
+ * verification of the Google ID token the phone obtained at sign-in.
+ *
+ * Required environment:
+ *   GOOGLE_WEB_CLIENT_ID  OAuth *Web* client id (same value as GOOGLE_WEB_CLIENT_ID in the app)
+ *   NEXORA_ID_SECRET      16+ random characters. Never change it: every nexoraId is derived from it.
+ * Strongly recommended:
+ *   NEXORA_DATA_DIR       directory on a PERSISTENT disk (database + uploaded media live here)
+ * Optional:
+ *   PUBLIC_BASE_URL, ADMIN_USER, ADMIN_PASSWORD, MAX_VIDEO_MB, MAX_IMAGE_MB, USER_QUOTA_MB, PORT
+ */
+const crypto = require('crypto');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
-const app = express();
+const { createSqliteStore } = require('./db');
+const { createAuth } = require('./auth');
+const { createUserRouter } = require('./user-routes');
+const { createContentRouter, cleanupStaleUploads } = require('./content-routes');
+const { str, clampInt, isHttpsUrl, guard } = require('./util');
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const MB = 1024 * 1024;
 
-// =========================================================================
-// Zentora CLC 6-Vault Core Architecture (জিরো ডামি ডেটা নীতি)
-// =========================================================================
-
-// ২য় ঘর: Zentora Sharded Registry (মেটাডাটা ও চ্যানেল ডিরেক্টরি)
-const ShardedRegistry = {
-    users: new Map(),          // userId -> { nexoraId, handle, email, channelId }
-    channels: new Map(),       // channelId -> { name, subscribers, verifiedBadge }
-    videoMetadata: new Map(),  // videoId -> { title, description, category, tags, channelName }
-    comments: new Map()        // videoId -> [ { commentId, author, text, timestamp } ]
-};
-
-// ৩য় ঘর: Zentora Metric Stream (ভিউ, ইন্টারঅ্যাকশন ও মেট্রিক্স)
-const MetricStream = {
-    viewCounters: new Map(),   // videoId -> Total Views
-    engagement: new Map(),     // videoId -> { likes, dislikes, sparks }
-    retentionLogs: new Map()   // videoId -> [ retentionScores ]
-};
-
-// ৪র্থ ঘর: Zentora Blobstore Vault (মূল ভিডিও ও থাম্বনেইল স্টোরেজ)
-const BlobstoreVault = {
-    videoBlobs: new Map(),     // videoId -> { streamUrl, duration, resolutionMap }
-    thumbnailBlobs: new Map()  // videoId -> { originalThumbUrl, miniThumbUrl }
-};
-
-// ৫ম ঘর: Zentora Dedicated Ad Engine (ডেডিকেটেড বিজ্ঞাপন ভল্ট - নো ডামি ডেটা)
-const DedicatedAdVault = {
-    activeAds: new Map(),      // adId -> { title, sponsorName, adMediaUrl, clickThroughUrl, skippableAfterSeconds }
-    adMetrics: new Map()       // adId -> { impressions, clicks, skips, completes }
-};
-
-// ৬ষ্ঠ মহা-ঘর: Zentora Grand Master Vault (সবার শীর্ষে থাকা চূড়ান্ত মাস্টার লেজার)
-const GrandMasterVault = {
-    immutableMasterLedger: [], // সর্বজনীন অপরিবর্তনীয় ট্রানজ্যাকশন ব্লক
-    globalCrossIndex: new Map(), // entityId -> { ShardRef, MetricRef, BlobRef, AdRef }
-    systemStateHash: ''
-};
-
-// ৬ষ্ঠ মহা-ঘরে সমস্ত ঘরের ডেটা সিঙ্ক ও লক করার সেন্ট্রাল প্রোটোকল
-function anchorToGrandMaster(eventType, sourceVault, dataPayload) {
-    const timestamp = Date.now();
-    const transactionId = 'ZT-MASTER-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-
-    const block = {
-        txId: transactionId,
-        sourceVault: sourceVault,
-        eventType: eventType,
-        timestamp: timestamp,
-        payload: dataPayload,
-        vaultHash: crypto.createHash('sha256').update(JSON.stringify(dataPayload) + timestamp).digest('hex')
-    };
-
-    GrandMasterVault.immutableMasterLedger.push(block);
-    GrandMasterVault.systemStateHash = block.vaultHash;
-    return block;
+function loadConfig(env = process.env) {
+  const dataDir = path.resolve(env.NEXORA_DATA_DIR || path.join(__dirname, 'data'));
+  return {
+    port: clampInt(env.PORT || 3000, 1, 65535),
+    dataDir,
+    dbPath: path.join(dataDir, 'nexora.db'),
+    mediaDir: path.join(dataDir, 'media'),
+    tmpDir: path.join(dataDir, 'uploads-tmp'),
+    idSecret: env.NEXORA_ID_SECRET || '',
+    googleAudiences: String(env.GOOGLE_WEB_CLIENT_ID || '').split(',').map((s) => s.trim()).filter(Boolean),
+    publicBaseUrl: env.PUBLIC_BASE_URL || '',
+    adminUser: env.ADMIN_USER || 'admin',
+    adminPassword: env.ADMIN_PASSWORD || '',
+    maxVideoBytes: clampInt(env.MAX_VIDEO_MB || 500, 1, 20000) * MB,
+    maxImageBytes: clampInt(env.MAX_IMAGE_MB || 10, 1, 200) * MB,
+    quotaBytes: clampInt(env.USER_QUOTA_MB || 2048, 1, 1000000) * MB,
+    chunkBytes: 8 * MB
+  };
 }
 
-// =========================================================================
-// সেন্ট্রাল এপিআই রাউটস (Nexora Cloud Protocol - NCP)
-// =========================================================================
+/** Verifies a Google ID token (signature, expiry, issuer, audience). The package is loaded lazily. */
+function defaultGoogleVerifier() {
+  const { OAuth2Client } = require('google-auth-library');
+  const client = new OAuth2Client();
+  return async (idToken, audiences) => {
+    const ticket = await client.verifyIdToken({ idToken, audience: audiences });
+    return ticket.getPayload();
+  };
+}
 
-// ১. সেন্ট্রাল হোম ফিড (জিরো ডামি ডেটা)
-app.get('/api/v1/feed', (req, res) => {
-    const publicFeed = [];
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
 
-    for (let [videoId, meta] of ShardedRegistry.videoMetadata.entries()) {
-        const metrics = MetricStream.engagement.get(videoId) || { likes: 0, dislikes: 0, sparks: 0 };
-        const views = MetricStream.viewCounters.get(videoId) || 0;
-        const media = BlobstoreVault.videoBlobs.get(videoId) || {};
-        const thumb = BlobstoreVault.thumbnailBlobs.get(videoId) || {};
-
-        publicFeed.push({
-            id: videoId,
-            ...meta,
-            views: views,
-            likes: metrics.likes,
-            videoUrl: media.streamUrl,
-            thumbnailUrl: thumb.originalThumbUrl
-        });
+function requireAdmin(config) {
+  return (req, res, next) => {
+    if (!config.adminPassword) return res.status(404).json({ success: false, error: 'admin_disabled' });
+    const m = /^Basic (.+)$/.exec(req.get('authorization') || '');
+    const decoded = m ? Buffer.from(m[1], 'base64').toString('utf8') : '';
+    const idx = decoded.indexOf(':');
+    const user = idx >= 0 ? decoded.slice(0, idx) : '';
+    const pass = idx >= 0 ? decoded.slice(idx + 1) : '';
+    if (idx < 0 || !safeEqual(user, config.adminUser) || !safeEqual(pass, config.adminPassword)) {
+      res.set('WWW-Authenticate', 'Basic realm="Nexora Admin", charset="UTF-8"');
+      return res.status(401).json({ success: false, error: 'unauthorized' });
     }
+    return next();
+  };
+}
 
-    res.json({ success: true, count: publicFeed.length, videos: publicFeed });
+const ADMIN_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexora Ads Admin</title>
+<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:32px auto;padding:0 16px}label{display:block;margin-top:12px;font-weight:600}
+input{width:100%;padding:10px;margin-top:4px;box-sizing:border-box}button{margin-top:16px;padding:12px 18px}pre{background:#f3f3f3;padding:12px;overflow:auto}</style>
+</head><body><h1>Create ad</h1>
+<form id="f">
+<label>Title<input name="title" required maxlength="100"></label>
+<label>Sponsor<input name="sponsorName" required maxlength="60"></label>
+<label>Ad media URL (https)<input name="adMediaUrl" type="url" required></label>
+<label>Click-through URL (https)<input name="clickThroughUrl" type="url" required></label>
+<label>Skippable after (seconds, 0-30)<input name="skippableAfterSeconds" type="number" min="0" max="30" value="5" required></label>
+<button type="submit">Create</button></form><pre id="out"></pre>
+<script>
+document.getElementById('f').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var d = Object.fromEntries(new FormData(e.target));
+  d.skippableAfterSeconds = Number(d.skippableAfterSeconds);
+  var r = await fetch('/api/v1/ads/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) });
+  document.getElementById('out').textContent = r.status + ' ' + await r.text();
 });
+</script></body></html>`;
 
-// ২. ভিডিও প্রকাশনা (ঘর ২ ও ৪-এ জমা করে ৬ষ্ঠ মহা-ঘরে চূড়ান্ত লক)
-app.post('/api/v1/videos/publish', (req, res) => {
-    const { title, description, category, tags, videoUrl, thumbnailUrl, channelName } = req.body;
-    const videoId = 'NEX-' + Date.now();
+function createApp({ config, store, googleVerifier }) {
+  const auth = createAuth({
+    idSecret: config.idSecret,
+    googleAudiences: config.googleAudiences,
+    googleVerifier: googleVerifier || defaultGoogleVerifier(),
+    store
+  });
 
-    const metaRecord = { title, description, category: category || 'General', tags: tags || '', channelName };
-    ShardedRegistry.videoMetadata.set(videoId, metaRecord);
+  const app = express();
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+  app.use(cors({ exposedHeaders: ['X-Nexora-Session-Token'] }));
+  app.use((_req, res, next) => {
+    res.set('X-Content-Type-Options', 'nosniff');
+    next();
+  });
 
-    MetricStream.viewCounters.set(videoId, 0);
-    MetricStream.engagement.set(videoId, { likes: 0, dislikes: 0, sparks: 0 });
+  const health = (_req, res) => res.json({ status: 'ok', service: 'nexora-backend', time: Date.now() });
+  app.get('/', health);
+  app.get('/health', health);
 
-    BlobstoreVault.videoBlobs.set(videoId, { streamUrl: videoUrl });
-    BlobstoreVault.thumbnailBlobs.set(videoId, { originalThumbUrl: thumbnailUrl });
+  app.use('/media', express.static(config.mediaDir, {
+    index: false,
+    dotfiles: 'ignore',
+    maxAge: '365d',
+    immutable: true,
+    setHeaders: (res) => res.set('X-Content-Type-Options', 'nosniff')
+  }));
 
-    GrandMasterVault.globalCrossIndex.set(videoId, {
-        shardRef: metaRecord,
-        metricRef: { views: 0, likes: 0 },
-        blobRef: { videoUrl, thumbnailUrl }
+  app.use('/api/v1/account', createUserRouter({ store, auth, config }));
+  app.use('/api/v1', createContentRouter({ store, auth, config }));
+
+  app.get('/api/v1/vaults/audit', guard(async (_req, res) => {
+    const c = await store.counts();
+    return res.json({
+      status: 'ONLINE',
+      system: 'Zentora Nexora Platform Core',
+      storage: { engine: 'sqlite', persistent: true },
+      vaults: {
+        vault1: { name: 'Identity', accounts: c.users },
+        vault2: { name: 'Content', videos: c.videos, mediaFiles: c.media },
+        vault5: { name: 'Ads', campaigns: c.ads },
+        vault6: { name: 'Master Ledger', blocks: c.ledgerBlocks, head: c.ledgerHead, chainValid: await store.verifyLedger() }
+      },
+      timestamp: Date.now()
     });
+  }));
 
-    const masterTx = anchorToGrandMaster('MASTER_VIDEO_INGESTED', 'VAULT_2_AND_4', { videoId, metaRecord });
+  // ------------------------------------------------------------------ ads (vault 5)
+  const adminOnly = requireAdmin(config);
+  app.get('/admin', adminOnly, (_req, res) => res.set('Content-Type', 'text/html; charset=utf-8').send(ADMIN_PAGE));
 
-    res.json({ success: true, message: 'Ingested and Locked into 6th Grand Master Vault', videoId, txId: masterTx.txId });
-});
-
-// ৩. রিয়েল-টাইম ইন্টারঅ্যাকশন
-app.post('/api/v1/videos/interact', (req, res) => {
-    const { videoId, action } = req.body;
-
-    if (!MetricStream.engagement.has(videoId)) {
-        return res.status(404).json({ success: false, message: 'Video not found in 3rd Metric Stream' });
+  app.post('/api/v1/ads/admin', adminOnly, express.json({ limit: '16kb' }), guard(async (req, res) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const title = str(b.title, 100).trim();
+    const sponsorName = str(b.sponsorName, 60).trim();
+    if (!title || !sponsorName || !isHttpsUrl(b.adMediaUrl) || !isHttpsUrl(b.clickThroughUrl)) {
+      return res.status(400).json({ success: false, error: 'invalid_ad' });
     }
-
-    const eng = MetricStream.engagement.get(videoId);
-    if (action === 'like') eng.likes += 1;
-    if (action === 'spark') eng.sparks += 1;
-    if (action === 'view') {
-        const currentViews = MetricStream.viewCounters.get(videoId) || 0;
-        MetricStream.viewCounters.set(videoId, currentViews + 1);
-    }
-
-    MetricStream.engagement.set(videoId, eng);
-    anchorToGrandMaster('INTERACTION_RECORDED', 'VAULT_3_METRIC_STREAM', { videoId, action });
-
-    res.json({ success: true, views: MetricStream.viewCounters.get(videoId), engagement: eng });
-});
-
-// =========================================================================
-// ৫ নম্বর ডেডিকেটেড বিজ্ঞাপন ভল্ট (Dedicated Ad Vault)
-// =========================================================================
-
-// ক. মোবাইল ব্রাউজার অ্যাডমিন পোর্টাল
-app.get('/admin/ads', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html lang="bn">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Nexora Ad Manager | 5th Vault</title>
-            <style>
-                body { background: #0b0e14; color: #f0f3f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; margin: 0; }
-                .box { max-width: 440px; margin: 20px auto; background: #161b22; padding: 24px; border-radius: 12px; border: 1px solid #30363d; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
-                h2 { margin-top: 0; color: #58a6ff; font-size: 1.3rem; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
-                label { display: block; margin-top: 14px; font-size: 0.85rem; color: #8b949e; }
-                input { width: 100%; padding: 12px; margin-top: 6px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #fff; box-sizing: border-box; font-size: 0.95rem; }
-                button { width: 100%; padding: 14px; margin-top: 22px; border-radius: 8px; border: none; background: #238636; color: #fff; font-size: 1rem; font-weight: bold; cursor: pointer; }
-                .badge { background: #1f6feb; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; vertical-align: middle; }
-                .note { font-size: 0.75rem; color: #8b949e; margin-top: 14px; text-align: center; }
-            </style>
-        </head>
-        <body>
-            <div class="box">
-                <h2>Nexora Ad Engine <span class="badge">5th Vault</span></h2>
-                <form action="/api/v1/ads/upload" method="POST">
-                    <label>Ad Campaign Title:</label>
-                    <input type="text" name="title" placeholder="যেমন: Nike Promo Video" required />
-
-                    <label>Sponsor / Company Name:</label>
-                    <input type="text" name="sponsorName" placeholder="যেমন: Nike Sports" required />
-
-                    <label>Original Ad Video Link (.mp4):</label>
-                    <input type="url" name="adMediaUrl" placeholder="https://.../video.mp4" required />
-
-                    <label>Company Website Link (Click-Through):</label>
-                    <input type="url" name="clickThroughUrl" placeholder="https://nike.com" required />
-
-                    <label>Skip Button Timer (Seconds):</label>
-                    <input type="number" name="skippableAfterSeconds" value="5" min="1" max="30" />
-
-                    <button type="submit">Deploy to 5th Ad Vault</button>
-                </form>
-                <div class="note">© 2026 Zentora CLC. Ingested directly into 6th Grand Master Vault.</div>
-            </div>
-        </body>
-        </html>
-    `);
-});
-
-// খ. ৫ নম্বর ভল্টে বিজ্ঞাপন আপলোড ও ৬ষ্ঠ মহা-ঘরে ট্রানজ্যাকশন লক
-app.post('/api/v1/ads/upload', (req, res) => {
-    const { title, sponsorName, adMediaUrl, clickThroughUrl, skippableAfterSeconds } = req.body;
-
-    if (!adMediaUrl || !clickThroughUrl) {
-        return res.status(400).json({ success: false, message: 'adMediaUrl and clickThroughUrl are required' });
-    }
-
-    const adId = 'ZT-AD-' + Date.now();
-    const adData = {
-        title: title || 'Direct Sponsor Ad',
-        sponsorName: sponsorName || 'Direct Partner',
-        adMediaUrl: adMediaUrl,
-        clickThroughUrl: clickThroughUrl,
-        skippableAfterSeconds: Number(skippableAfterSeconds) || 5
+    const ad = {
+      adId: 'ad_' + crypto.randomBytes(8).toString('hex'),
+      title,
+      sponsorName,
+      adMediaUrl: b.adMediaUrl,
+      clickThroughUrl: b.clickThroughUrl,
+      skippableAfterSeconds: clampInt(b.skippableAfterSeconds, 0, 30)
     };
+    await store.createAd(ad);
+    await store.anchor('AD_CREATED', 'VAULT_5', { adId: ad.adId });
+    return res.status(201).json({ success: true, adId: ad.adId });
+  }));
 
-    // ৫ নম্বর ঘরে সংরক্ষণ
-    DedicatedAdVault.activeAds.set(adId, adData);
-    DedicatedAdVault.adMetrics.set(adId, { impressions: 0, clicks: 0, skips: 0, completes: 0 });
+  app.get('/api/v1/ads/next', guard(async (_req, res) => {
+    const ad = await store.pickRandomAd();
+    return res.json({ success: true, ad: ad ? { ...ad, metrics: undefined } : null });
+  }));
 
-    // ৬ষ্ঠ মহা-ঘরে ক্রিপ্টোগ্রাফিক লক
-    const masterTx = anchorToGrandMaster('DIRECT_AD_INGESTED', 'VAULT_5_AD_ENGINE', { adId, adData });
+  app.post('/api/v1/ads/track', express.json({ limit: '4kb' }), guard(async (req, res) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const metrics = await store.trackAd(str(b.adId, 40), str(b.action, 16));
+    if (!metrics) return res.status(404).json({ success: false, error: 'not_found' });
+    return res.json({ success: true });
+  }));
 
-    res.json({
-        success: true,
-        message: 'Original ad deployed to 5th Vault & locked into 6th Grand Master Vault',
-        adId: adId,
-        masterTxId: masterTx.txId
+  app.use((_req, res) => res.status(404).json({ success: false, error: 'not_found' }));
+
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, _req, res, _next) => {
+    const status = err && (err.status || err.statusCode) ? err.status || err.statusCode : 500;
+    if (status >= 500) console.error('[nexora] unhandled', err && err.stack ? err.stack : err);
+    if (res.headersSent) return res.end();
+    return res.status(status).json({ success: false, error: status === 413 ? 'payload_too_large' : status === 400 ? 'bad_request' : 'unavailable' });
+  });
+
+  return { app, auth };
+}
+
+function main() {
+  const config = loadConfig();
+  if (config.idSecret.length < 16) throw new Error('NEXORA_ID_SECRET must be set to 16+ random characters');
+  if (config.googleAudiences.length === 0) throw new Error('GOOGLE_WEB_CLIENT_ID must be set');
+  const store = createSqliteStore({ dbPath: config.dbPath });
+  const { app } = createApp({ config, store });
+
+  const sweep = () => cleanupStaleUploads({ store, tmpDir: config.tmpDir, maxAgeMs: 24 * 60 * 60 * 1000 })
+    .catch((e) => console.error('[nexora] upload cleanup failed', e && e.message));
+  sweep();
+  const timer = setInterval(sweep, 60 * 60 * 1000);
+  timer.unref();
+
+  const server = app.listen(config.port, () => {
+    console.log(`[nexora] listening on ${config.port}, data dir ${config.dataDir}`);
+  });
+  server.requestTimeout = 0;
+  server.headersTimeout = 65 * 1000;
+  server.keepAliveTimeout = 65 * 1000;
+
+  const shutdown = () => {
+    server.close(() => {
+      store.close();
+      process.exit(0);
     });
-});
+    setTimeout(() => process.exit(0), 10000).unref();
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
 
-// গ. অ্যান্ড্রয়েড প্লেয়ারের জন্য প্রি-রোল বিজ্ঞাপন সার্ভিস
-app.get('/api/v1/ads/pre-roll', (req, res) => {
-    const adEntries = Array.from(DedicatedAdVault.activeAds.entries());
+if (require.main === module) main();
 
-    if (adEntries.length === 0) {
-        return res.json({ success: true, hasAd: false, ad: null });
-    }
-
-    const [adId, adData] = adEntries[Math.floor(Math.random() * adEntries.length)];
-
-    const metrics = DedicatedAdVault.adMetrics.get(adId);
-    metrics.impressions += 1;
-    DedicatedAdVault.adMetrics.set(adId, metrics);
-
-    anchorToGrandMaster('AD_IMPRESSION', 'VAULT_5_AD_ENGINE', { adId });
-
-    res.json({
-        success: true,
-        hasAd: true,
-        ad: {
-            adId: adId,
-            title: adData.title,
-            sponsorName: adData.sponsorName,
-            adMediaUrl: adData.adMediaUrl,
-            clickThroughUrl: adData.clickThroughUrl,
-            skippableAfterSeconds: adData.skippableAfterSeconds
-        }
-    });
-});
-
-// ঘ. বিজ্ঞাপন মেট্রিক্স ট্র্যাকিং (ক্লিক, স্কিপ, কম্প্লিট)
-app.post('/api/v1/ads/track', (req, res) => {
-    const { adId, action } = req.body;
-
-    if (!DedicatedAdVault.adMetrics.has(adId)) {
-        return res.status(404).json({ success: false, message: 'Ad not found in 5th Ad Vault' });
-    }
-
-    const metrics = DedicatedAdVault.adMetrics.get(adId);
-    if (action === 'click') metrics.clicks += 1;
-    if (action === 'skip') metrics.skips += 1;
-    if (action === 'complete') metrics.completes += 1;
-
-    DedicatedAdVault.adMetrics.set(adId, metrics);
-    anchorToGrandMaster(`AD_${action.toUpperCase()}`, 'VAULT_5_AD_ENGINE', { adId });
-
-    res.json({ success: true, metrics: metrics });
-});
-
-// =========================================================================
-// ৬ষ্ঠ মহা-ঘরের সার্বিক অডিট ও সিস্টেম হেলথ চেক
-// =========================================================================
-app.get('/api/v1/vaults/audit', (req, res) => {
-    res.json({
-        platform: 'Nexora Stream',
-        organization: 'Zentora CLC',
-        developer: 'Zentora',
-        vault_1_device_storage: 'Android Room DB (Synchronized)',
-        vault_2_sharded_metadata_count: ShardedRegistry.videoMetadata.size,
-        vault_3_metric_stream_records: MetricStream.viewCounters.size,
-        vault_4_blobstore_items: BlobstoreVault.videoBlobs.size,
-        vault_5_dedicated_ad_engine_active_ads: DedicatedAdVault.activeAds.size,
-        vault_6_grand_master_total_blocks: GrandMasterVault.immutableMasterLedger.length,
-        systemIntegrityHash: GrandMasterVault.systemStateHash
-    });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Zentora 6-Vault Core Engine active on port ${PORT}`);
-});
+module.exports = { createApp, loadConfig, defaultGoogleVerifier };
