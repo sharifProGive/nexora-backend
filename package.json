@@ -1,13 +1,20 @@
 {
   "name": "nexora-backend",
-  "version": "1.0.0",
-  "description": "Nexora Cloud Core Engine - Zentora CLC",
+  "version": "4.0.0",
+  "description": "Nexora self-hosted backend: 30-chain server mesh, 35 categorized vaults, Google identity, media, ads and the Vault 35 SHA-256 master ledger (SQLite).",
   "main": "server.js",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "google-auth-library": "^9.15.1"
   }
 }
