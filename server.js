@@ -2,6 +2,8 @@
 /* © 2026 Zentora CLC. All rights reserved. Platform Core engineered by Zentora. */
 /**
  * Nexora backend (self-hosted): Express + SQLite (node:sqlite) + local media storage.
+ * Architecture: a 30-chain-server mesh (mesh.js) in front of 35 categorized vaults (vaults.js, db.js), secured by
+ * Vault 35, the SHA-256 hash-chained master ledger.
  * No Firebase, no third-party database, no third-party storage. The only external call is the
  * verification of the Google ID token the phone obtained at sign-in.
  *
@@ -11,7 +13,8 @@
  * Strongly recommended:
  *   NEXORA_DATA_DIR       directory on a PERSISTENT disk (database + uploaded media live here)
  * Optional:
- *   PUBLIC_BASE_URL, ADMIN_USER, ADMIN_PASSWORD, MAX_VIDEO_MB, MAX_IMAGE_MB, USER_QUOTA_MB, PORT
+ *   PUBLIC_BASE_URL, ADMIN_USER, ADMIN_PASSWORD, MAX_VIDEO_MB, MAX_IMAGE_MB, USER_QUOTA_MB, PORT,
+ *   REQUIRE_HTTPS (true = chain server 2 rejects plain http), MESH_RATE_PER_MINUTE, MESH_BURST_PER_SECOND
  */
 const crypto = require('crypto');
 const path = require('path');
@@ -21,6 +24,8 @@ const { createSqliteStore } = require('./db');
 const { createAuth } = require('./auth');
 const { createUserRouter } = require('./user-routes');
 const { createContentRouter, cleanupStaleUploads } = require('./content-routes');
+const { createMesh } = require('./mesh');
+const { VAULTS, VAULT_COUNT, vaultByNo, vaultCode } = require('./vaults');
 const { str, clampInt, isHttpsUrl, guard } = require('./util');
 
 const MB = 1024 * 1024;
@@ -41,7 +46,10 @@ function loadConfig(env = process.env) {
     maxVideoBytes: clampInt(env.MAX_VIDEO_MB || 500, 1, 20000) * MB,
     maxImageBytes: clampInt(env.MAX_IMAGE_MB || 10, 1, 200) * MB,
     quotaBytes: clampInt(env.USER_QUOTA_MB || 2048, 1, 1000000) * MB,
-    chunkBytes: 8 * MB
+    chunkBytes: 8 * MB,
+    requireHttps: String(env.REQUIRE_HTTPS || '').toLowerCase() === 'true',
+    meshRatePerMinute: clampInt(env.MESH_RATE_PER_MINUTE || 1200, 10, 1000000),
+    meshBurstPerSecond: clampInt(env.MESH_BURST_PER_SECOND || 60, 1, 100000)
   };
 }
 
@@ -111,7 +119,9 @@ function createApp({ config, store, googleVerifier }) {
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
-  app.use(cors({ exposedHeaders: ['X-Nexora-Session-Token'] }));
+  app.use(cors({ exposedHeaders: ['X-Nexora-Session-Token', 'X-Nexora-Mesh', 'X-Request-Id'] }));
+  const mesh = createMesh({ store, config });
+  app.use(mesh.middleware);
   app.use((_req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
     next();
@@ -132,23 +142,53 @@ function createApp({ config, store, googleVerifier }) {
   app.use('/api/v1/account', createUserRouter({ store, auth, config }));
   app.use('/api/v1', createContentRouter({ store, auth, config }));
 
+  /** Vault 35: the audit of the whole platform. chainValid re-computes every block of the ledger. */
   app.get('/api/v1/vaults/audit', guard(async (_req, res) => {
-    const c = await store.counts();
+    const records = await store.vaultRecords();
+    const stats = mesh.vaultStats();
+    const vaults = {};
+    for (const v of VAULTS) {
+      const s = stats[v.no - 1];
+      vaults['vault' + String(v.no).padStart(2, '0')] = {
+        no: v.no, name: v.name, cluster: v.cluster, subVaults: v.subVaults,
+        ops: s.ops, errors: s.errors, lastOpAt: s.lastOpAt, breaker: s.breaker, records: records[v.no]
+      };
+    }
     return res.json({
       status: 'ONLINE',
       system: 'Zentora Nexora Platform Core',
       storage: { engine: 'sqlite', persistent: true },
-      vaults: {
-        vault1: { name: 'Identity', accounts: c.users },
-        vault2: { name: 'Content', videos: c.videos, mediaFiles: c.media },
-        vault5: { name: 'Ads', campaigns: c.ads },
-        vault6: { name: 'Master Ledger', blocks: c.ledgerBlocks, head: c.ledgerHead, chainValid: await store.verifyLedger() }
-      },
+      mesh: { chainServers: mesh.STAGE_COUNT, egressGateway: 30 },
+      vaultCount: VAULT_COUNT,
+      ledger: { blocks: records[35].blocks, head: records[35].head, chainValid: await store.verifyLedger() },
+      vaults,
       timestamp: Date.now()
     });
   }));
 
-  // ------------------------------------------------------------------ ads (vault 5)
+  app.get('/api/v1/mesh/status', guard(async (_req, res) => res.json({
+    success: true,
+    chainServers: mesh.describe(),
+    vaults: mesh.vaultStats().map((s) => ({ ...s, name: vaultByNo(s.no).name })),
+    timestamp: Date.now()
+  })));
+
+  app.get('/api/v1/vaults/:no', guard(async (req, res) => {
+    const no = Number(req.params.no);
+    const vault = Number.isInteger(no) ? vaultByNo(no) : null;
+    if (!vault) return res.status(404).json({ success: false, error: 'not_found' });
+    const records = await store.vaultRecords();
+    const stats = mesh.vaultStats()[no - 1];
+    return res.json({ success: true, vault: { ...vault, ...stats, code: vaultCode(no), records: records[no] } });
+  }));
+
+  /** Seals the current state of vaults 1..34 into one ledger block (also runs every hour). */
+  app.post('/api/v1/vaults/checkpoint', requireAdmin(config), guard(async (_req, res) => {
+    const block = await store.checkpointVaults();
+    return res.status(201).json({ success: true, txId: block.txId, vaultHash: block.vaultHash });
+  }));
+
+  // ------------------------------------------------------------------ ads (vault 02)
   const adminOnly = requireAdmin(config);
   app.get('/admin', adminOnly, (_req, res) => res.set('Content-Type', 'text/html; charset=utf-8').send(ADMIN_PAGE));
 
@@ -168,7 +208,7 @@ function createApp({ config, store, googleVerifier }) {
       skippableAfterSeconds: clampInt(b.skippableAfterSeconds, 0, 30)
     };
     await store.createAd(ad);
-    await store.anchor('AD_CREATED', 'VAULT_5', { adId: ad.adId });
+    await store.anchor('AD_CREATED', 'VAULT_02', { adId: ad.adId });
     return res.status(201).json({ success: true, adId: ad.adId });
   }));
 
@@ -194,7 +234,7 @@ function createApp({ config, store, googleVerifier }) {
     return res.status(status).json({ success: false, error: status === 413 ? 'payload_too_large' : status === 400 ? 'bad_request' : 'unavailable' });
   });
 
-  return { app, auth };
+  return { app, auth, mesh };
 }
 
 function main() {
@@ -202,13 +242,24 @@ function main() {
   if (config.idSecret.length < 16) throw new Error('NEXORA_ID_SECRET must be set to 16+ random characters');
   if (config.googleAudiences.length === 0) throw new Error('GOOGLE_WEB_CLIENT_ID must be set');
   const store = createSqliteStore({ dbPath: config.dbPath });
-  const { app } = createApp({ config, store });
+  const { app, mesh } = createApp({ config, store });
 
   const sweep = () => cleanupStaleUploads({ store, tmpDir: config.tmpDir, maxAgeMs: 24 * 60 * 60 * 1000 })
     .catch((e) => console.error('[nexora] upload cleanup failed', e && e.message));
   sweep();
   const timer = setInterval(sweep, 60 * 60 * 1000);
   timer.unref();
+
+  const checkpoint = () => {
+    try {
+      store.checkpointVaults();
+    } catch (e) {
+      console.error('[nexora] vault checkpoint failed', e && e.message);
+    }
+  };
+  checkpoint();
+  const checkpointTimer = setInterval(checkpoint, 60 * 60 * 1000);
+  checkpointTimer.unref();
 
   const server = app.listen(config.port, () => {
     console.log(`[nexora] listening on ${config.port}, data dir ${config.dataDir}`);
@@ -219,6 +270,7 @@ function main() {
 
   const shutdown = () => {
     server.close(() => {
+      mesh.close();
       store.close();
       process.exit(0);
     });
