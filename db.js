@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const { MEDIA_PATH_RE } = require('./util');
-const { VAULTS, SHARD_FIRST, SHARD_COUNT, shardVaultFor, vaultCode, LEDGER_VAULT } = require('./vaults');
+const { VAULTS, SHARD_FIRST, SHARD_COUNT, shardVaultFor, vaultCode, FRIENDS_VAULT, ALGORITHM_VAULT, LEDGER_VAULT } = require('./vaults');
 
 const SCHEMA_V1 = `
 CREATE TABLE users (
@@ -162,7 +162,35 @@ CREATE TABLE vault_stats (
 CREATE INDEX idx_videos_premiere ON videos(is_premiere, premiere_scheduled_ms);
 `;
 
-const MIGRATIONS = [SCHEMA_V1, SCHEMA_V2];
+/**
+ * v3 - Vault 35 (Friends: sub-vaults friends, friend-requests, friend-relationships). Vault 37 becomes the master
+ * ledger, so the operation counters that were kept under vault 35 move to 37 (ledger rows keep the vault name they
+ * were sealed with: rewriting them would break the hash chain).
+ * Handles become unique (case-insensitive) because friends are found by handle. Accounts that already share a
+ * handle keep it for the oldest account; the others get a suffix derived from their own nexoraId.
+ * friend_links holds one row per PAIR of accounts: 'pending' while the request is open, 'accepted' afterwards.
+ * pair_key (smaller id | larger id) makes a second row for the same two accounts impossible, in either direction.
+ */
+const SCHEMA_V3 = `
+UPDATE vault_stats SET vault_no = 37 WHERE vault_no = 35;
+UPDATE users SET handle = handle || '_' || lower(substr(nexora_id, 4, 6))
+  WHERE handle <> '' AND rowid NOT IN (SELECT MIN(rowid) FROM users WHERE handle <> '' GROUP BY lower(handle));
+CREATE UNIQUE INDEX idx_users_handle ON users(lower(handle)) WHERE handle <> '';
+CREATE TABLE friend_links (
+  link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pair_key TEXT NOT NULL UNIQUE,
+  requester_id TEXT NOT NULL,
+  addressee_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (requester_id <> addressee_id)
+);
+CREATE INDEX idx_friend_requester ON friend_links(requester_id, status, updated_at DESC);
+CREATE INDEX idx_friend_addressee ON friend_links(addressee_id, status, updated_at DESC);
+`;
+
+const MIGRATIONS = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 const SCHEMA_VERSION = MIGRATIONS.length;
 
 const GENESIS_HASH = '0'.repeat(64);
@@ -283,6 +311,18 @@ function createSqliteStore({ dbPath }) {
     return userFromRow(stmt('SELECT * FROM users WHERE nexora_id = ?').get(nexoraId));
   }
 
+  /** First free handle: the wanted one, then the wanted one with a growing part of the account's own id. */
+  function freeHandle(wanted, nexoraId) {
+    const taken = (h) => !!stmt('SELECT 1 AS t FROM users WHERE lower(handle) = lower(?) LIMIT 1').get(h);
+    if (!taken(wanted)) return wanted;
+    const tail = nexoraId.slice(3).toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (let n = 4; n <= tail.length; n += 2) {
+      const candidate = wanted + '_' + tail.slice(0, n);
+      if (!taken(candidate)) return candidate;
+    }
+    return wanted + '_' + crypto.randomBytes(4).toString('hex');
+  }
+
   function createUserIfAbsent(sub, rec) {
     return transaction(() => {
       const existing = stmt('SELECT * FROM users WHERE sub = ?').get(sub);
@@ -291,9 +331,10 @@ function createSqliteStore({ dbPath }) {
         return { user: userFromRow(existing), created: false };
       }
       const now = Date.now();
+      const handle = rec.handle ? freeHandle(rec.handle, rec.nexoraId) : '';
       stmt(
         'INSERT INTO users (sub, nexora_id, email, username, handle, avatar_uri, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(sub, rec.nexoraId, rec.email || '', rec.username || '', rec.handle || '', rec.avatarUri || '', now, now);
+      ).run(sub, rec.nexoraId, rec.email || '', rec.username || '', handle, rec.avatarUri || '', now, now);
       return { user: userFromRow(stmt('SELECT * FROM users WHERE sub = ?').get(sub)), created: true };
     });
   }
@@ -302,9 +343,18 @@ function createSqliteStore({ dbPath }) {
     stmt('UPDATE users SET last_seen_at = ? WHERE sub = ?').run(Date.now(), sub);
   }
 
+  /** Returns { user } or { conflict: true } when another account already uses that handle. */
   function updateProfile(nexoraId, p) {
-    stmt('UPDATE users SET username = ?, handle = ?, avatar_uri = ? WHERE nexora_id = ?').run(p.username, p.handle, p.avatarUri, nexoraId);
-    return findUserByNexoraId(nexoraId);
+    return transaction(() => {
+      const owner = stmt('SELECT nexora_id FROM users WHERE lower(handle) = lower(?) LIMIT 1').get(p.handle);
+      if (p.handle && owner && owner.nexora_id !== nexoraId) return { conflict: true };
+      stmt('UPDATE users SET username = ?, handle = ?, avatar_uri = ? WHERE nexora_id = ?').run(p.username, p.handle, p.avatarUri, nexoraId);
+      return { user: findUserByNexoraId(nexoraId) };
+    });
+  }
+
+  function findUserByHandle(handle) {
+    return userFromRow(stmt('SELECT * FROM users WHERE lower(handle) = lower(?) LIMIT 1').get(handle));
   }
 
   function getPrivate(nexoraId) {
@@ -630,7 +680,127 @@ function createSqliteStore({ dbPath }) {
     return adFromRow(stmt('SELECT * FROM ads WHERE ad_id = ?').get(adId)).metrics;
   }
 
-  // ------------------------------------------------------------------ vault 35: hash-chained master ledger
+  // ------------------------------------------------------------------ vault 35: friends (friends, friend-requests, friend-relationships)
+  const FRIENDS_CODE = vaultCode(FRIENDS_VAULT);
+  const MAX_PENDING_OUTGOING = 200;
+
+  function pairKey(a, b) {
+    return a < b ? a + '|' + b : b + '|' + a;
+  }
+
+  function personFromRow(r) {
+    return { nexoraId: r.nexora_id, username: r.username, handle: r.handle, avatarUri: r.avatar_uri };
+  }
+
+  /** How [otherId] relates to [viewerId]: none | friends | request_sent | request_received. */
+  function friendRelation(viewerId, otherId) {
+    const row = stmt('SELECT requester_id, status FROM friend_links WHERE pair_key = ?').get(pairKey(viewerId, otherId));
+    if (!row) return 'none';
+    if (row.status === 'accepted') return 'friends';
+    return row.requester_id === viewerId ? 'request_sent' : 'request_received';
+  }
+
+  /**
+   * Accounts whose handle starts with [query] (at least 3 characters), never the viewer itself. It is a range scan on
+   * the unique lower(handle) index, so the cost does not grow with the number of accounts.
+   */
+  function searchPeople(viewerId, query, limit) {
+    const clean = String(query).replace(/^@+/, '').trim().toLowerCase();
+    if (clean.length < 3) return [];
+    const low = '@' + clean;
+    const rows = stmt(
+      `SELECT * FROM users
+       WHERE handle <> '' AND lower(handle) >= ? AND lower(handle) < ? AND nexora_id <> ?
+       ORDER BY lower(handle) ASC LIMIT ?`
+    ).all(low, low + '￿', viewerId, limit);
+    return rows.map((r) => ({ ...personFromRow(r), relation: friendRelation(viewerId, r.nexora_id) }));
+  }
+
+  /**
+   * Sends a friend request. When the other account has already asked this one, the two requests meet and the
+   * friendship is created at once. Returns one of:
+   *   sent | already_sent | already_friends | accepted | limit_reached | not_found | self
+   */
+  function requestFriend(viewerId, targetId) {
+    return transaction(() => {
+      if (viewerId === targetId) return 'self';
+      if (!stmt('SELECT 1 AS x FROM users WHERE nexora_id = ?').get(targetId)) return 'not_found';
+      const key = pairKey(viewerId, targetId);
+      const link = stmt('SELECT link_id, requester_id, status FROM friend_links WHERE pair_key = ?').get(key);
+      const now = Date.now();
+      if (link) {
+        if (link.status === 'accepted') return 'already_friends';
+        if (link.requester_id === viewerId) return 'already_sent';
+        stmt("UPDATE friend_links SET status = 'accepted', updated_at = ? WHERE link_id = ?").run(now, link.link_id);
+        anchor('FRIEND_ACCEPTED', FRIENDS_CODE, { a: targetId, b: viewerId });
+        return 'accepted';
+      }
+      const open = stmt("SELECT COUNT(*) AS n FROM friend_links WHERE requester_id = ? AND status = 'pending'").get(viewerId).n;
+      if (open >= MAX_PENDING_OUTGOING) return 'limit_reached';
+      stmt("INSERT INTO friend_links (pair_key, requester_id, addressee_id, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)")
+        .run(key, viewerId, targetId, now, now);
+      anchor('FRIEND_REQUESTED', FRIENDS_CODE, { from: viewerId, to: targetId });
+      return 'sent';
+    });
+  }
+
+  /** Accepts or declines the request [fromId] sent to [viewerId]. Returns false when there is no such open request. */
+  function respondFriendRequest(viewerId, fromId, accept) {
+    return transaction(() => {
+      const link = stmt("SELECT link_id FROM friend_links WHERE requester_id = ? AND addressee_id = ? AND status = 'pending'").get(fromId, viewerId);
+      if (!link) return false;
+      if (accept) {
+        stmt("UPDATE friend_links SET status = 'accepted', updated_at = ? WHERE link_id = ?").run(Date.now(), link.link_id);
+        anchor('FRIEND_ACCEPTED', FRIENDS_CODE, { a: fromId, b: viewerId });
+      } else {
+        stmt('DELETE FROM friend_links WHERE link_id = ?').run(link.link_id);
+        anchor('FRIEND_DECLINED', FRIENDS_CODE, { from: fromId, by: viewerId });
+      }
+      return true;
+    });
+  }
+
+  /** Withdraws the request [viewerId] sent to [targetId]. */
+  function cancelFriendRequest(viewerId, targetId) {
+    return transaction(() => {
+      const r = stmt("DELETE FROM friend_links WHERE requester_id = ? AND addressee_id = ? AND status = 'pending'").run(viewerId, targetId);
+      if (r.changes === 0) return false;
+      anchor('FRIEND_CANCELLED', FRIENDS_CODE, { from: viewerId, to: targetId });
+      return true;
+    });
+  }
+
+  /** Ends an accepted friendship (either side may do it). */
+  function removeFriend(viewerId, otherId) {
+    return transaction(() => {
+      const r = stmt("DELETE FROM friend_links WHERE pair_key = ? AND status = 'accepted'").run(pairKey(viewerId, otherId));
+      if (r.changes === 0) return false;
+      anchor('FRIEND_REMOVED', FRIENDS_CODE, { a: viewerId, b: otherId });
+      return true;
+    });
+  }
+
+  /** Everything the Friends screen shows: confirmed friends, requests waiting for this account, requests it sent. */
+  function listFriendships(viewerId) {
+    const withPerson = (rows) => rows.map((r) => ({ ...personFromRow(r), since: r.updated_at, requestedAt: r.created_at }));
+    const friends = stmt(
+      `SELECT u.*, l.updated_at, l.created_at FROM friend_links l
+       JOIN users u ON u.nexora_id = CASE WHEN l.requester_id = ? THEN l.addressee_id ELSE l.requester_id END
+       WHERE l.status = 'accepted' AND (l.requester_id = ? OR l.addressee_id = ?)
+       ORDER BY u.username COLLATE NOCASE ASC LIMIT 5000`
+    ).all(viewerId, viewerId, viewerId);
+    const incoming = stmt(
+      `SELECT u.*, l.updated_at, l.created_at FROM friend_links l JOIN users u ON u.nexora_id = l.requester_id
+       WHERE l.addressee_id = ? AND l.status = 'pending' ORDER BY l.created_at DESC LIMIT 500`
+    ).all(viewerId);
+    const outgoing = stmt(
+      `SELECT u.*, l.updated_at, l.created_at FROM friend_links l JOIN users u ON u.nexora_id = l.addressee_id
+       WHERE l.requester_id = ? AND l.status = 'pending' ORDER BY l.created_at DESC LIMIT 500`
+    ).all(viewerId);
+    return { friends: withPerson(friends), incoming: withPerson(incoming), outgoing: withPerson(outgoing) };
+  }
+
+  // ------------------------------------------------------------------ vault 37: hash-chained master ledger
   function anchor(eventType, sourceVault, payload) {
     return transaction(() => {
       const head = stmt('SELECT vault_hash FROM ledger ORDER BY seq DESC LIMIT 1').get();
@@ -694,7 +864,7 @@ function createSqliteStore({ dbPath }) {
     return out;
   }
 
-  /** What each vault holds right now. Vault 35 reports the ledger. The digest of this object secures the vault. */
+  /** What each vault holds right now. Vault 37 reports the ledger. The digest of this object secures the vault. */
   function vaultRecords() {
     const n = (sql) => stmt(sql).get().n;
     const vid = stmt('SELECT COALESCE(SUM(views), 0) AS views, COALESCE(SUM(likes), 0) AS likes, COALESCE(SUM(dislikes), 0) AS dislikes, COALESCE(SUM(sparks), 0) AS sparks, COALESCE(SUM(shares), 0) AS shares FROM videos').get();
@@ -721,12 +891,17 @@ function createSqliteStore({ dbPath }) {
       if (records[r.vault_no]) records[r.vault_no] = { events: r.c };
     }
     const head = stmt('SELECT vault_hash FROM ledger ORDER BY seq DESC LIMIT 1').get();
+    records[FRIENDS_VAULT] = {
+      friendRelationships: n("SELECT COUNT(*) AS n FROM friend_links WHERE status = 'accepted'"),
+      friendRequests: n("SELECT COUNT(*) AS n FROM friend_links WHERE status = 'pending'")
+    };
+    records[ALGORITHM_VAULT] = {};
     records[LEDGER_VAULT] = { blocks: n('SELECT COUNT(*) AS n FROM ledger'), head: head ? head.vault_hash : '' };
     return records;
   }
 
   /**
-   * Anchors one ledger block that carries the digest of every vault (1..34). Changing any record in any vault
+   * Anchors one ledger block that carries the digest of every vault (every vault except 37). Changing any record in any vault
    * afterwards changes that vault's digest in the next checkpoint, and the chain makes the old digests unforgeable.
    */
   function checkpointVaults() {
@@ -746,9 +921,10 @@ function createSqliteStore({ dbPath }) {
   return {
     kind: 'sqlite',
     path: dbPath,
-    findUserBySub, findUserByNexoraId, createUserIfAbsent, touchUser, updateProfile, getPrivate, savePrivate,
+    findUserBySub, findUserByNexoraId, findUserByHandle, createUserIfAbsent, touchUser, updateProfile, getPrivate, savePrivate,
     upsertVideo, getVideo, listVideosByOwner, listPublicVideosByOwner, listFeed, searchVideos, deleteVideo, addVideoDelta, likedVideoIds, dislikedVideoIds,
     getChannel, listPremieres,
+    friendRelation, searchPeople, requestFriend, respondFriendRequest, cancelFriendRequest, removeFriend, listFriendships,
     upsertComment, listComments, shareComment, getComment,
     recordMedia, findMedia, deleteMediaRows, storageUsed, createUpload, getUpload, countOpenUploads, setUploadExt, completeUpload, deleteUpload, listStaleUploads,
     createAd, pickRandomAd, trackAd,
