@@ -2,7 +2,7 @@
 /* © 2026 Zentora CLC. All rights reserved. Platform Core engineered by Zentora. */
 /**
  * Friends (mounted at /api/v1/account/friends). Served by Vault 35 (Friends; sub-vaults: friends, friend-requests,
- * friend-relationships). Every call needs a Nexora session token; the caller is always req.user, never an id
+ * friend-relationships, friend-chat). Every call needs a Nexora session token; the caller is always req.user, never an id
  * from the request body.
  *
  *   GET  /list      -> { friends, incoming, outgoing }  (the whole Friends screen in one response)
@@ -11,12 +11,14 @@
  *   POST /respond   { nexoraId, accept }                -> accepts or declines a request that person sent to the caller
  *   POST /cancel    { nexoraId }                        -> withdraws a request the caller sent
  *   POST /remove    { nexoraId }                        -> ends a friendship
+ *   /chat/*         send, read, sync                    -> private messages between friends (chat-routes.js)
  *
  * A person is always { nexoraId, username, handle, avatarUri }. Nothing else about an account is shared.
  */
 const express = require('express');
 const { str, absolutize, publicBase, guard } = require('./util');
 const { rateLimit } = require('./auth');
+const { createChatRouter } = require('./chat-routes');
 
 const NEXORA_ID_RE = /^nx_[A-Za-z0-9_-]{22}$/;
 const HANDLE_RE = /^@?[A-Za-z0-9_.]{3,64}$/;
@@ -114,6 +116,9 @@ function createFriendsRouter({ store, auth, config }) {
     if (!done) return res.status(404).json({ success: false, error: 'friend_not_found' });
     return res.json({ success: true });
   }));
+
+  // Private chat between friends (sub-vault friend-chat): /api/v1/account/friends/chat/*
+  router.use('/chat', createChatRouter({ store, auth, config }));
 
   return router;
 }
