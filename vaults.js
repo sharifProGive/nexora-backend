@@ -20,7 +20,7 @@
  *   10 Premiere & Live          premiere schedule and live window
  *   11-34 Expansion Shards      24 high-load shards; every engagement event of a video is appended to the shard
  *                               selected by a stable hash of the video id, so heavy videos do not share one hot table
- *   35 Friends                  everything between friends: friends, friend requests, friend relationships
+ *   35 Friends                  everything between friends: friends, friend requests, friend relationships, chat
  *                               (file sending, voice and video calling join here as they are built)
  *   36 Algorithm                the ranking and delivery algorithms (video push, video ranking, notifications);
  *                               its sub-vaults are listed as each algorithm goes live
@@ -91,7 +91,7 @@ function buildVaults() {
     key: 'friends',
     name: 'Unified Friends Vault',
     cluster: 'social',
-    subVaults: ['friends', 'friend-requests', 'friend-relationships']
+    subVaults: ['friends', 'friend-requests', 'friend-relationships', 'friend-chat']
   });
   vaults.push({
     no: ALGORITHM_VAULT,
@@ -141,6 +141,8 @@ const ROUTES = [
   ['*', /^\/api\/v1\/account\/(?:restore|save-profile)$/, 3, 'session'],
   ['GET', /^\/api\/v1\/account\/friends\/(?:list|search)$/, FRIENDS_VAULT, 'session'],
   ['POST', /^\/api\/v1\/account\/friends\/(?:request|respond|cancel|remove)$/, FRIENDS_VAULT, 'session'],
+  ['GET', /^\/api\/v1\/account\/friends\/chat\/sync$/, FRIENDS_VAULT, 'session'],
+  ['POST', /^\/api\/v1\/account\/friends\/chat\/(?:send|read)$/, FRIENDS_VAULT, 'session'],
   ['GET', /^\/api\/v1\/feed$/, 7, 'public'],
   ['GET', /^\/api\/v1\/videos\/search$/, 8, 'public'],
   ['POST', /^\/api\/v1\/videos\/interact$/, 1, 'session'],
