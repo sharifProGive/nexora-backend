@@ -6,13 +6,15 @@
  *   GET  /get-profile   Google ID token  -> 200 profile | 404 not_found (the app then calls /register)
  *   POST /register      Google ID token  -> creates the account (idempotent) and returns the permanent nexoraId
  *   GET  /restore       session token    -> profile + every video this account published + liked / disliked video ids
- *   GET  /get-private   session token    -> phone / billing (Vault 3, owner only)
+ *   GET  /get-private   session token    -> phone / billing (Vault 5, owner only)
  *   POST /save-private  session token
- *   POST /save-profile  session token    -> display name, handle, avatar
+ *   POST /save-profile  session token    -> display name, handle (unique, 409 handle_taken), avatar
+ *   /friends/*          session token    -> friends, requests, relationships (friends-routes.js, Vault 35)
  */
 const express = require('express');
 const { str, isHttpsUrl, creatorLevel, canonicalizeMediaUrl, publicBase, absolutize, toVideoItem, guard } = require('./util');
 const { rateLimit } = require('./auth');
+const { createFriendsRouter } = require('./friends-routes');
 
 function slugHandle(name, nexoraId) {
   const base = str(name, 40).toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -103,9 +105,12 @@ function createUserRouter({ store, auth, config }) {
       const candidate = await canonicalizeMediaUrl(body.avatarUri, req.user.nexoraId, store);
       if (candidate !== null && (candidate === '' || candidate.startsWith('/media/') || isHttpsUrl(candidate))) avatarUri = candidate;
     }
-    const updated = await store.updateProfile(req.user.nexoraId, { username, handle, avatarUri });
-    return res.json(profileJson(updated, publicBase(req, config), null));
+    const result = await store.updateProfile(req.user.nexoraId, { username, handle, avatarUri });
+    if (result.conflict) return res.status(409).json({ success: false, error: 'handle_taken' });
+    return res.json(profileJson(result.user, publicBase(req, config), null));
   }));
+
+  router.use('/friends', createFriendsRouter({ store, auth, config }));
 
   return router;
 }
