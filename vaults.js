@@ -1,11 +1,11 @@
 'use strict';
 /* © 2026 Zentora CLC. All rights reserved. Platform Core engineered by Zentora. */
 /**
- * The 35 Nexora vaults.
+ * The 37 Nexora vaults.
  *
  * A vault is a domain boundary: it owns a set of tables (its sub-vaults), its own operation counters and its own
- * record digest, and every vault is secured by Vault 35, the SHA-256 hash-chained master ledger.
- * All 35 vaults live in ONE SQLite database so related data is never fragmented across files, and so one
+ * record digest, and every vault is secured by Vault 37, the SHA-256 hash-chained master ledger.
+ * All 37 vaults live in ONE SQLite database so related data is never fragmented across files, and so one
  * transaction can span several vaults (for example a like touches Vault 01 and its expansion shard).
  *
  *   01 Social Engagement        views, likes, dislikes, comments, comment-shares, video-shares, sparks
@@ -20,15 +20,21 @@
  *   10 Premiere & Live          premiere schedule and live window
  *   11-34 Expansion Shards      24 high-load shards; every engagement event of a video is appended to the shard
  *                               selected by a stable hash of the video id, so heavy videos do not share one hot table
- *   35 Grand Master Ledger      hash-chained immutable ledger, checkpoints, chain verifier
+ *   35 Friends                  everything between friends: friends, friend requests, friend relationships
+ *                               (file sending, voice and video calling join here as they are built)
+ *   36 Algorithm                the ranking and delivery algorithms (video push, video ranking, notifications);
+ *                               its sub-vaults are listed as each algorithm goes live
+ *   37 Master Vault             the master backend: hash-chained immutable ledger, vault checkpoints, chain verifier
  */
 const crypto = require('crypto');
 
-const VAULT_COUNT = 35;
+const VAULT_COUNT = 37;
 const SHARD_FIRST = 11;
 const SHARD_LAST = 34;
 const SHARD_COUNT = SHARD_LAST - SHARD_FIRST + 1;
-const LEDGER_VAULT = 35;
+const FRIENDS_VAULT = 35;
+const ALGORITHM_VAULT = 36;
+const LEDGER_VAULT = 37;
 
 const CORE_VAULTS = [
   {
@@ -81,9 +87,23 @@ function buildVaults() {
     });
   }
   vaults.push({
+    no: FRIENDS_VAULT,
+    key: 'friends',
+    name: 'Unified Friends Vault',
+    cluster: 'social',
+    subVaults: ['friends', 'friend-requests', 'friend-relationships']
+  });
+  vaults.push({
+    no: ALGORITHM_VAULT,
+    key: 'algorithm',
+    name: 'Algorithm Vault',
+    cluster: 'algorithm',
+    subVaults: []
+  });
+  vaults.push({
     no: LEDGER_VAULT,
-    key: 'ledger',
-    name: 'Supreme Grand Master Ledger Vault',
+    key: 'master',
+    name: 'Master Vault (Master Backend & Grand Ledger)',
     cluster: 'ledger',
     subVaults: ['sha256-hash-chain', 'vault-checkpoints', 'chain-verifier']
   });
@@ -98,7 +118,7 @@ function vaultByNo(no) {
   return VAULTS[no - 1] || null;
 }
 
-/** "VAULT_01" ... "VAULT_35": the name written into the master ledger. */
+/** "VAULT_01" ... "VAULT_37": the name written into the master ledger. */
 function vaultCode(no) {
   return 'VAULT_' + String(no).padStart(2, '0');
 }
@@ -119,6 +139,8 @@ const ROUTES = [
   ['POST', /^\/api\/v1\/account\/register$/, 3, 'google'],
   ['*', /^\/api\/v1\/account\/(?:get-private|save-private)$/, 5, 'session'],
   ['*', /^\/api\/v1\/account\/(?:restore|save-profile)$/, 3, 'session'],
+  ['GET', /^\/api\/v1\/account\/friends\/(?:list|search)$/, FRIENDS_VAULT, 'session'],
+  ['POST', /^\/api\/v1\/account\/friends\/(?:request|respond|cancel|remove)$/, FRIENDS_VAULT, 'session'],
   ['GET', /^\/api\/v1\/feed$/, 7, 'public'],
   ['GET', /^\/api\/v1\/videos\/search$/, 8, 'public'],
   ['POST', /^\/api\/v1\/videos\/interact$/, 1, 'session'],
@@ -153,6 +175,8 @@ module.exports = {
   SHARD_FIRST,
   SHARD_LAST,
   SHARD_COUNT,
+  FRIENDS_VAULT,
+  ALGORITHM_VAULT,
   LEDGER_VAULT,
   vaultByNo,
   vaultCode,
