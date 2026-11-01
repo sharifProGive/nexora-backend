@@ -2,8 +2,8 @@
 /* © 2026 Zentora CLC. All rights reserved. Platform Core engineered by Zentora. */
 /**
  * Nexora backend (self-hosted): Express + SQLite (node:sqlite) + local media storage.
- * Architecture: a 30-chain-server mesh (mesh.js) in front of 35 categorized vaults (vaults.js, db.js), secured by
- * Vault 35, the SHA-256 hash-chained master ledger.
+ * Architecture: a 30-chain-server mesh (mesh.js) in front of 37 categorized vaults (vaults.js, db.js), secured by
+ * Vault 37, the master vault with the SHA-256 hash-chained ledger.
  * No Firebase, no third-party database, no third-party storage. The only external call is the
  * verification of the Google ID token the phone obtained at sign-in.
  *
@@ -25,7 +25,7 @@ const { createAuth } = require('./auth');
 const { createUserRouter } = require('./user-routes');
 const { createContentRouter, cleanupStaleUploads } = require('./content-routes');
 const { createMesh } = require('./mesh');
-const { VAULTS, VAULT_COUNT, vaultByNo, vaultCode } = require('./vaults');
+const { VAULTS, VAULT_COUNT, LEDGER_VAULT, vaultByNo, vaultCode } = require('./vaults');
 const { str, clampInt, isHttpsUrl, guard } = require('./util');
 
 const MB = 1024 * 1024;
@@ -142,7 +142,7 @@ function createApp({ config, store, googleVerifier }) {
   app.use('/api/v1/account', createUserRouter({ store, auth, config }));
   app.use('/api/v1', createContentRouter({ store, auth, config }));
 
-  /** Vault 35: the audit of the whole platform. chainValid re-computes every block of the ledger. */
+  /** Vault 37 (master): the audit of the whole platform. chainValid re-computes every block of the ledger. */
   app.get('/api/v1/vaults/audit', guard(async (_req, res) => {
     const records = await store.vaultRecords();
     const stats = mesh.vaultStats();
@@ -160,7 +160,7 @@ function createApp({ config, store, googleVerifier }) {
       storage: { engine: 'sqlite', persistent: true },
       mesh: { chainServers: mesh.STAGE_COUNT, egressGateway: 30 },
       vaultCount: VAULT_COUNT,
-      ledger: { blocks: records[35].blocks, head: records[35].head, chainValid: await store.verifyLedger() },
+      ledger: { blocks: records[LEDGER_VAULT].blocks, head: records[LEDGER_VAULT].head, chainValid: await store.verifyLedger() },
       vaults,
       timestamp: Date.now()
     });
@@ -182,7 +182,7 @@ function createApp({ config, store, googleVerifier }) {
     return res.json({ success: true, vault: { ...vault, ...stats, code: vaultCode(no), records: records[no] } });
   }));
 
-  /** Seals the current state of vaults 1..34 into one ledger block (also runs every hour). */
+  /** Seals the current state of every vault except the master into one ledger block (also runs every hour). */
   app.post('/api/v1/vaults/checkpoint', requireAdmin(config), guard(async (_req, res) => {
     const block = await store.checkpointVaults();
     return res.status(201).json({ success: true, txId: block.txId, vaultHash: block.vaultHash });
