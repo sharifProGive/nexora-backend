@@ -11,6 +11,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { MEDIA_PATH_RE } = require('./util');
 const { VAULTS, SHARD_FIRST, SHARD_COUNT, shardVaultFor, vaultCode, FRIENDS_VAULT, ALGORITHM_VAULT, LEDGER_VAULT } = require('./vaults');
 const { createChatStore, SCHEMA_V4 } = require('./chat-store');
+const { createCallStore, SCHEMA_V5 } = require('./calls-store');
 
 const SCHEMA_V1 = `
 CREATE TABLE users (
@@ -192,7 +193,8 @@ CREATE INDEX idx_friend_addressee ON friend_links(addressee_id, status, updated_
 `;
 
 /** v4 - Vault 35 sub-vault friend-chat: the chat event log (see chat-store.js). */
-const MIGRATIONS = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+/** v5 - Vault 35 sub-vault friend-calls: the log of finished calls (see calls-store.js). */
+const MIGRATIONS = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 const SCHEMA_VERSION = MIGRATIONS.length;
 
 const GENESIS_HASH = '0'.repeat(64);
@@ -805,6 +807,9 @@ function createSqliteStore({ dbPath }) {
   // ------------------------------------------------------------------ vault 35: friend-chat (messages and read receipts)
   const chat = createChatStore({ stmt, transaction, pairKey });
 
+  // ------------------------------------------------------------------ vault 35: friend-calls (signaling and call log)
+  const calls = createCallStore({ stmt, pairKey });
+
   // ------------------------------------------------------------------ vault 37: hash-chained master ledger
   function anchor(eventType, sourceVault, payload) {
     return transaction(() => {
@@ -899,7 +904,8 @@ function createSqliteStore({ dbPath }) {
     records[FRIENDS_VAULT] = {
       friendRelationships: n("SELECT COUNT(*) AS n FROM friend_links WHERE status = 'accepted'"),
       friendRequests: n("SELECT COUNT(*) AS n FROM friend_links WHERE status = 'pending'"),
-      chatEvents: chat.chatHead()
+      chatEvents: chat.chatHead(),
+      calls: calls.callCount()
     };
     records[ALGORITHM_VAULT] = {};
     records[LEDGER_VAULT] = { blocks: n('SELECT COUNT(*) AS n FROM ledger'), head: head ? head.vault_hash : '' };
@@ -932,6 +938,8 @@ function createSqliteStore({ dbPath }) {
     getChannel, listPremieres,
     friendRelation, searchPeople, requestFriend, respondFriendRequest, cancelFriendRequest, removeFriend, listFriendships,
     sendChat: chat.sendChat, markChatRead: chat.markChatRead, chatSync: chat.chatSync,
+    startCall: calls.start, answerCall: calls.answer, declineCall: calls.decline, endCall: calls.end,
+    signalCall: calls.signal, checkCall: calls.check, sweepCalls: calls.sweep,
     upsertComment, listComments, shareComment, getComment,
     recordMedia, findMedia, deleteMediaRows, storageUsed, createUpload, getUpload, countOpenUploads, setUploadExt, completeUpload, deleteUpload, listStaleUploads,
     createAd, pickRandomAd, trackAd,
