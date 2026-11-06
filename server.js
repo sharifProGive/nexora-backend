@@ -49,7 +49,12 @@ function loadConfig(env = process.env) {
     chunkBytes: 8 * MB,
     requireHttps: String(env.REQUIRE_HTTPS || '').toLowerCase() === 'true',
     meshRatePerMinute: clampInt(env.MESH_RATE_PER_MINUTE || 1200, 10, 1000000),
-    meshBurstPerSecond: clampInt(env.MESH_BURST_PER_SECOND || 60, 1, 100000)
+    meshBurstPerSecond: clampInt(env.MESH_BURST_PER_SECOND || 60, 1, 100000),
+    // Calls (Vault 35, friend-calls). Your own STUN/TURN (coturn) servers, comma separated, e.g. "stun:turn.example.com:3478"
+    // and "turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp". TURN_SECRET is coturn's static-auth-secret.
+    stunUrls: String(env.STUN_URLS || '').split(',').map((x) => x.trim()).filter(Boolean),
+    turnUrls: String(env.TURN_URLS || '').split(',').map((x) => x.trim()).filter(Boolean),
+    turnSecret: env.TURN_SECRET || ''
   };
 }
 
