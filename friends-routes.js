@@ -12,6 +12,7 @@
  *   POST /cancel    { nexoraId }                        -> withdraws a request the caller sent
  *   POST /remove    { nexoraId }                        -> ends a friendship
  *   /chat/*         send, read, sync                    -> private messages between friends (chat-routes.js)
+ *   /calls/*        ice, start, answer, decline, end, signal, poll -> voice and video calls (calls-routes.js)
  *
  * A person is always { nexoraId, username, handle, avatarUri }. Nothing else about an account is shared.
  */
@@ -19,6 +20,7 @@ const express = require('express');
 const { str, absolutize, publicBase, guard } = require('./util');
 const { rateLimit } = require('./auth');
 const { createChatRouter } = require('./chat-routes');
+const { createCallsRouter } = require('./calls-routes');
 
 const NEXORA_ID_RE = /^nx_[A-Za-z0-9_-]{22}$/;
 const HANDLE_RE = /^@?[A-Za-z0-9_.]{3,64}$/;
@@ -119,6 +121,9 @@ function createFriendsRouter({ store, auth, config }) {
 
   // Private chat between friends (sub-vault friend-chat): /api/v1/account/friends/chat/*
   router.use('/chat', createChatRouter({ store, auth, config }));
+
+  // Voice and video calls between friends (sub-vault friend-calls): /api/v1/account/friends/calls/*
+  router.use('/calls', createCallsRouter({ store, auth, config }));
 
   return router;
 }
