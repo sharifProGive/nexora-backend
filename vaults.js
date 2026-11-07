@@ -158,6 +158,10 @@ const ROUTES = [
   ['GET', /^\/admin$/, 2, 'admin'],
   ['GET', /^\/api\/v1\/channels\/[^/]+(?:\/videos)?$/, 6, 'public'],
   ['GET', /^\/api\/v1\/premieres$/, 10, 'public'],
+  ['*', /^\/api\/v1\/admin(?:\/[A-Za-z0-9_-]+){1,4}$/, LEDGER_VAULT, 'admin'],
+  ['POST', /^\/api\/v1\/account\/delete-me$/, 3, 'session'],
+  ['GET', /^\/api\/v1\/backup\/(?:info|snapshot)$/, LEDGER_VAULT, 'admin'],
+  ['POST', /^\/api\/v1\/backup\/(?:restore|open)$/, LEDGER_VAULT, 'admin'],
   ['GET', /^\/api\/v1\/(?:vaults\/audit|vaults\/\d+|mesh\/status)$/, LEDGER_VAULT, 'public'],
   ['POST', /^\/api\/v1\/vaults\/checkpoint$/, LEDGER_VAULT, 'admin'],
   ['GET', /^\/media\/[A-Za-z0-9._-]+$/, 9, 'public']
