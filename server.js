@@ -15,6 +15,9 @@
  * Optional:
  *   PUBLIC_BASE_URL, ADMIN_USER, ADMIN_PASSWORD, MAX_VIDEO_MB, MAX_IMAGE_MB, USER_QUOTA_MB, PORT,
  *   REQUIRE_HTTPS (true = chain server 2 rejects plain http), MESH_RATE_PER_MINUTE, MESH_BURST_PER_SECOND
+ *   STUN_URLS, TURN_URLS, TURN_SECRET (voice and video calls)
+ *   ADMIN_APP_TOKEN (32+ random characters: turns on the owner's private admin app, see admin-routes.js),
+ *   ADMIN_RESET (16+ random characters: put a NEW value here only to register a new admin phone when the recovery code is lost)
  */
 const crypto = require('crypto');
 const path = require('path');
@@ -25,6 +28,7 @@ const { createAuth } = require('./auth');
 const { createUserRouter } = require('./user-routes');
 const { createContentRouter, cleanupStaleUploads } = require('./content-routes');
 const { createMesh } = require('./mesh');
+const { createAdmin } = require('./admin-routes');
 const { VAULTS, VAULT_COUNT, LEDGER_VAULT, vaultByNo, vaultCode } = require('./vaults');
 const { str, clampInt, isHttpsUrl, guard } = require('./util');
 
@@ -54,7 +58,10 @@ function loadConfig(env = process.env) {
     // and "turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp". TURN_SECRET is coturn's static-auth-secret.
     stunUrls: String(env.STUN_URLS || '').split(',').map((x) => x.trim()).filter(Boolean),
     turnUrls: String(env.TURN_URLS || '').split(',').map((x) => x.trim()).filter(Boolean),
-    turnSecret: env.TURN_SECRET || ''
+    turnSecret: env.TURN_SECRET || '',
+    // Owner administration (Vault 37). Off unless ADMIN_APP_TOKEN is set. See admin-routes.js.
+    adminToken: env.ADMIN_APP_TOKEN || '',
+    adminResetNonce: env.ADMIN_RESET || ''
   };
 }
 
@@ -135,6 +142,13 @@ function createApp({ config, store, googleVerifier }) {
   const health = (_req, res) => res.json({ status: 'ok', service: 'nexora-backend', time: Date.now() });
   app.get('/', health);
   app.get('/health', health);
+
+  // Owner administration and account deletion (Vault 37): a banned or deleted account is refused everywhere; the admin
+  // paths need ADMIN_APP_TOKEN plus the owner's phone key; /account/delete-me lets a user delete their own account.
+  const admin = createAdmin({ store, auth, config });
+  app.use(admin.banGate);
+  app.use('/api/v1/admin', admin.router);
+  app.use('/api/v1/account/delete-me', admin.selfRouter);
 
   app.use('/media', express.static(config.mediaDir, {
     index: false,
@@ -239,7 +253,7 @@ function createApp({ config, store, googleVerifier }) {
     return res.status(status).json({ success: false, error: status === 413 ? 'payload_too_large' : status === 400 ? 'bad_request' : 'unavailable' });
   });
 
-  return { app, auth, mesh };
+  return { app, auth, mesh, admin };
 }
 
 function main() {
@@ -247,7 +261,7 @@ function main() {
   if (config.idSecret.length < 16) throw new Error('NEXORA_ID_SECRET must be set to 16+ random characters');
   if (config.googleAudiences.length === 0) throw new Error('GOOGLE_WEB_CLIENT_ID must be set');
   const store = createSqliteStore({ dbPath: config.dbPath });
-  const { app, mesh } = createApp({ config, store });
+  const { app, mesh, admin } = createApp({ config, store });
 
   const sweep = () => cleanupStaleUploads({ store, tmpDir: config.tmpDir, maxAgeMs: 24 * 60 * 60 * 1000 })
     .catch((e) => console.error('[nexora] upload cleanup failed', e && e.message));
@@ -276,6 +290,7 @@ function main() {
   const shutdown = () => {
     server.close(() => {
       mesh.close();
+      admin.close();
       store.close();
       process.exit(0);
     });
